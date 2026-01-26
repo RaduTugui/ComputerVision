@@ -5,30 +5,51 @@ from torch.utils.data import Dataset
 from matplotlib import pyplot as plt
 from load_dataset import ImagesDataset
 
-def augment_image(img_np: np.ndarray, index: int) -> (torch.Tensor, str):
-    transformations = [
-        transforms.GaussianBlur(5),
-        transforms.RandomRotation(180),
-        transforms.RandomVerticalFlip(180),
-        transforms.RandomHorizontalFlip(180),
-        transforms.RandomResizedCrop(100),
-        transforms.ColorJitter(brightness=0.445, contrast=0.445, saturation=0.445, hue=0.445),
 
+def augment_image(img_np: np.ndarray, index: int) -> tuple[torch.Tensor, str]:
+    # Ensure input is uint8 for PIL-like transforms if needed, or float for Tensor
+    # If img_np is float (0-1), these transforms work fine on Tensors.
+
+    transformations = [
+        # 1. Blur (Noise robustness)
+        transforms.GaussianBlur(kernel_size=5),
+
+        # 2. Rotation (Orientation robustness)
+        transforms.RandomRotation(degrees=45),
+
+        # 3. Flips (Corrected to use probability p=0.5 instead of 180)
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomHorizontalFlip(p=0.5),
+
+        # 4. THE CRITICAL FIX: RandomResizedCrop
+        # scale=(0.3, 1.0): Learn from parts as small as 30% of the object (e.g., handles)
+        transforms.RandomResizedCrop(100, scale=(0.3, 1.0)),
+
+        # 5. Color Jitter (Lighting robustness)
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
     ]
 
-    v =index % 7
-    if v ==0:
+    v = index % 7
+    if v == 0:
         image_torch = torch.from_numpy(img_np)
-        return image_torch,"Original"
-    elif v <=5:
-        transform=transformations[v - 1]
-        image_torch=transform(torch.from_numpy(img_np))
-        return image_torch,transform.__class__.__name__
+        return image_torch, "Original"
+
+    elif v <= 5:
+        # Apply single transformation
+        transform = transformations[v - 1]
+        # Ensure we work with Tensor
+        img_t = torch.from_numpy(img_np)
+        image_torch = transform(img_t)
+        return image_torch, transform.__class__.__name__
+
     else:
-        transform1,transform2,transform3 = np.random.choice(transformations, 3, replace=False)
-        compose = transforms.Compose([transform1, transform2, transform3])
-        image_torch = compose(torch.from_numpy(img_np))
-        return image_torch,"Compose"
+        # Apply composite (Mix of 3)
+        # We allow crop to be selected here too!
+        subset = np.random.choice(transformations, 3, replace=False)
+        compose = transforms.Compose(list(subset))
+        img_t = torch.from_numpy(img_np)
+        image_torch = compose(img_t)
+        return image_torch, "Compose"
 
 
 class TransformedImagesDataset(Dataset):
