@@ -15,7 +15,7 @@ def augment_image(img_np: np.ndarray, index: int) -> tuple[torch.Tensor, str]:
         transforms.GaussianBlur(kernel_size=5),
 
         # 2. Rotation (Orientation robustness)
-        transforms.RandomRotation(degrees=45),
+        transforms.RandomRotation(degrees=180),
 
         # 3. Flips (Corrected to use probability p=0.5 instead of 180)
         transforms.RandomVerticalFlip(p=0.5),
