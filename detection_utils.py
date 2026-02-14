@@ -1,97 +1,117 @@
 import numpy as np
-import cv2  # <--- Added missing import
+import cv2
 
 
-def sliding_window(image, step_size, window_size):
+# Change std_dev_thresh from 15 to 5
+def is_box_valid(roi, std_dev_thresh=5, min_aspect=0.3, max_aspect=3.0):
     """
-    Yields (x, y, window) chunks from the image.
+    SMART FILTER: Rejects boxes that don't look like real objects.
     """
-    for y in range(0, image.shape[0] - window_size[1], step_size):
-        for x in range(0, image.shape[1] - window_size[0], step_size):
-            yield (x, y, image[y:y + window_size[1], x:x + window_size[0]])
+    if roi.size == 0: return False
+    h, w = roi.shape[:2]
+
+    # Aspect Ratio
+    ratio = w / float(h)
+    if ratio < min_aspect or ratio > max_aspect:
+        return False
+
+    # Texture
+    if len(roi.shape) == 3:
+        gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = roi
+
+    mean, std_dev = cv2.meanStdDev(gray)
 
 
-def tighten_box(original_image, box, padding=5):
+    if std_dev[0][0] < std_dev_thresh:
+        return False
+
+    return True
+
+def group_overlapping_boxes(boxes, overlap_thresh=0.15):
     """
-    Refines a bounding box by finding the object's contours inside the box.
-    Works best on images with solid/light backgrounds.
+    Class-Aware NMS: Allows Cat and Dog to overlap, but removes duplicate Dogs.
     """
-    # <--- FIXED: Ensure coordinates are integers for slicing
-    x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+    if len(boxes) == 0: return []
+    boxes = np.array(boxes)
+    final_boxes = []
 
-    # Extract the region of interest (ROI)
-    roi = original_image[y1:y2, x1:x2]
+    # Get unique classes detected (e.g., 0=Cat, 1=Dog)
+    unique_classes = np.unique(boxes[:, 5])
 
-    if roi.size == 0:
-        return box
+    for cls in unique_classes:
+        # Get only boxes for this specific class
+        cls_indices = np.where(boxes[:, 5] == cls)[0]
+        cls_boxes = boxes[cls_indices]
 
-    # 1. Convert to grayscale and blur slightly
-    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        pick = []
+        x1 = cls_boxes[:, 0]
+        y1 = cls_boxes[:, 1]
+        x2 = cls_boxes[:, 2]
+        y2 = cls_boxes[:, 3]
+        scores = cls_boxes[:, 4]
+        area = (x2 - x1) * (y2 - y1)
 
-    # 2. Thresholding: Detect the object vs background
-    # (THRESH_BINARY_INV assumes light background, dark object)
-    _, thresh = cv2.threshold(blurred, 220, 255, cv2.THRESH_BINARY_INV)
+        idxs = np.argsort(scores)
 
-    # 3. Find contours of the object inside the ROI
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        while len(idxs) > 0:
+            last = len(idxs) - 1
+            i = idxs[last]
+            pick.append(i)
 
-    if not contours:
-        return box  # Return original if no contour found
+            xx1 = np.maximum(x1[i], x1[idxs[:last]])
+            yy1 = np.maximum(y1[i], y1[idxs[:last]])
+            xx2 = np.minimum(x2[i], x2[idxs[:last]])
+            yy2 = np.minimum(y2[i], y2[idxs[:last]])
 
-    # 4. Find the largest contour (the object)
-    c = max(contours, key=cv2.contourArea)
-    rx, ry, rw, rh = cv2.boundingRect(c)
+            w = np.maximum(0, xx2 - xx1)
+            h = np.maximum(0, yy2 - yy1)
+            intersection = w * h
 
-    # 5. Calculate new coordinates relative to the ORIGINAL image
-    new_x1 = x1 + rx - padding
-    new_y1 = y1 + ry - padding
-    new_x2 = x1 + rx + rw + padding
-    new_y2 = y1 + ry + rh + padding
+            iou = intersection / (area[i] + area[idxs[:last]] - intersection)
 
-    # Ensure we don't go out of image bounds
-    h_img, w_img, _ = original_image.shape
-    new_x1 = max(0, new_x1)
-    new_y1 = max(0, new_y1)
-    new_x2 = min(w_img, new_x2)
-    new_y2 = min(h_img, new_y2)
+            # Delete highly overlapping boxes
+            idxs = np.delete(idxs, np.concatenate(([last], np.where(iou > overlap_thresh)[0])))
 
-    # Return updated box with original score/label
-    return [new_x1, new_y1, new_x2, new_y2, box[4], box[5]]
+        final_boxes.extend(cls_boxes[pick])
+
+    return np.array(final_boxes)
 
 
 def remove_contained_boxes(boxes):
-    """
-    Removes boxes that are completely (or mostly) inside another box with higher confidence.
-    """
-    if len(boxes) == 0:
-        return []
+    """Removes a box if it is completely inside another box of the same class."""
+    if len(boxes) == 0: return []
 
-    # Sort boxes by confidence (highest first)
-    boxes = sorted(boxes, key=lambda x: x[4], reverse=True)
-
+    # Sort by size (area), largest first
+    boxes = sorted(boxes, key=lambda x: (x[2] - x[0]) * (x[3] - x[1]), reverse=True)
     keep = []
 
-    for i, current_box in enumerate(boxes):
-        cx1, cy1, cx2, cy2 = current_box[:4]
-        current_area = (cx2 - cx1) * (cy2 - cy1)
+    for current_box in boxes:
         is_contained = False
+        cx1, cy1, cx2, cy2 = current_box[:4]
+        c_label = current_box[5]
+        c_area = (cx2 - cx1) * (cy2 - cy1)
 
         for kept_box in keep:
             kx1, ky1, kx2, ky2 = kept_box[:4]
+            k_label = kept_box[5]
 
-            # Check if current_box is inside kept_box
+            # Only remove if it's contained in a box of the SAME class
+            # (Don't let a big Chair delete a small Cat)
+            if c_label != k_label:
+                continue
+
             ix1 = max(cx1, kx1)
             iy1 = max(cy1, ky1)
             ix2 = min(cx2, kx2)
             iy2 = min(cy2, ky2)
-
             iw = max(0, ix2 - ix1)
             ih = max(0, iy2 - iy1)
-            intersection_area = iw * ih
+            intersection = iw * ih
 
-            # If >90% of the current box is inside a bigger box
-            if intersection_area > 0.90 * current_area:
+            # If 90% contained, delete it
+            if intersection > 0.90 * c_area:
                 is_contained = True
                 break
 
@@ -101,45 +121,35 @@ def remove_contained_boxes(boxes):
     return keep
 
 
-def group_overlapping_boxes(boxes, overlap_thresh=0.1):
+def tighten_box(original_image, box, padding=5):
     """
-    ADVANCED: Instead of deleting overlaps, it AVERAGES them.
+    Tries to shrink the box to fit the object contour.
+    Warning: Can be unstable on complex backgrounds.
     """
-    if len(boxes) == 0:
-        return []
+    h_img, w_img, _ = original_image.shape
+    x1, y1, x2, y2 = map(int, box[:4])
 
-    boxes = np.array(boxes)
-    final_boxes = []
+    # Safety clamp
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w_img, x2), min(h_img, y2)
 
-    while len(boxes) > 0:
-        base_box = boxes[0]
+    roi = original_image[y1:y2, x1:x2]
+    if roi.size == 0: return box
 
-        x1 = np.maximum(base_box[0], boxes[:, 0])
-        y1 = np.maximum(base_box[1], boxes[:, 1])
-        x2 = np.minimum(base_box[2], boxes[:, 2])
-        y2 = np.minimum(base_box[3], boxes[:, 3])
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blurred, 220, 255, cv2.THRESH_BINARY_INV)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        w = np.maximum(0, x2 - x1)
-        h = np.maximum(0, y2 - y1)
-        intersection = w * h
+    if not contours: return box
 
-        area_base = (base_box[2] - base_box[0]) * (base_box[3] - base_box[1])
-        area_others = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    c = max(contours, key=cv2.contourArea)
+    rx, ry, rw, rh = cv2.boundingRect(c)
 
-        iou = intersection / (area_base + area_others - intersection)
-
-        overlapping_indices = np.where(iou > overlap_thresh)[0]
-        subset = boxes[overlapping_indices]
-
-        # Average coordinates
-        avg_box = np.mean(subset, axis=0)
-
-        # Keep max score and mode label
-        avg_box[4] = np.max(subset[:, 4])
-        labels = subset[:, 5].astype(int)
-        avg_box[5] = np.bincount(labels).argmax()
-
-        final_boxes.append(avg_box)
-        boxes = np.delete(boxes, overlapping_indices, axis=0)
-
-    return np.array(final_boxes)
+    return [
+        max(0, x1 + rx - padding),
+        max(0, y1 + ry - padding),
+        min(w_img, x1 + rx + rw + padding),
+        min(h_img, y1 + ry + rh + padding),
+        box[4], box[5]
+    ]

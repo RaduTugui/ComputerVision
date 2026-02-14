@@ -3,94 +3,117 @@ import torch
 import numpy as np
 import cv2
 from PIL import Image, ImageDraw, ImageFont
+import pandas as pd
 
-# Custom modules
+
 from architecture import MyCNN
 from gray_scale_conversion import to_grayscale
 from histogram_equalization import apply_clahe
-from detection_utils import group_overlapping_boxes, remove_contained_boxes, tighten_box
+from detection_utils import group_overlapping_boxes, remove_contained_boxes, is_box_valid
+
+CONFIDENCE_THRESHOLD = 0.85
+NMS_THRESHOLD = 0.10
+MIN_ASPECT_RATIO = 0.4
+MAX_ASPECT_RATIO = 2.5
+STD_DEV_THRESHOLD = 20
 
 
-# --- NEW: Selective Search Function ---
-def predict_selective_search(model, full_image_np, class_names, conf_threshold=0.9):
-    """
-    Uses OpenCV Selective Search to propose regions, then classifies them with MyCNN.
-    """
-    # 1. Initialize Selective Search
+#Loading the labels
+@st.cache_data
+def load_class_names(csv_path="training_data/labels.csv"):
+    try:
+        # Load CSV with ';' delimiter as seen in your file
+        df = pd.read_csv(csv_path, sep=';')
+        # Get unique labels and sort them (to match training order)
+        class_names = sorted(df['label'].unique())
+        return class_names
+    except Exception as e:
+        st.error(f"Error loading labels.csv: {e}")
+        return [f"Class_{i}" for i in range(20)]
+
+
+
+def predict_and_count(model, full_image_np, class_names):
+    # Initialize Selective Search
     ss = cv2.ximgproc.segmentation.createSelectiveSearchSegmentation()
     ss.setBaseImage(full_image_np)
-
-    # "Fast" gives ~2,000 boxes. "Quality" gives ~10,000 (too slow for CPU).
     ss.switchToSelectiveSearchFast()
 
-    # 2. Run Selective Search (returns x, y, w, h)
     rects = ss.process()
 
-    detected_boxes = []
-    window_size = (100, 100)  # Input size for MyCNN
+    batch_tensors = []
+    batch_coords = []
+    window_size = (100, 100)
 
-    # 3. Batch process regions (optional optimization: batching tensors speeds this up)
+    # Limit to 2000 boxes for speed
+    if len(rects) > 2000:
+        rects = rects[:2000]
+
     for (x, y, w, h) in rects:
-        # Filter out tiny garbage boxes to save time
-        if w < 50 or h < 50:
-            continue
+        #Filter tiny boxes
+        if w < 50 or h < 50: continue
 
-        # Crop the candidate region
+        #Smart Filter: Reject weird shapes (lines) or empty backgrounds
         roi = full_image_np[y:y + h, x:x + w]
-
         if roi.size == 0: continue
 
-        # --- PREPROCESS FOR MyCNN ---
-        # 1. Grayscale
-        gray = to_grayscale(roi)
-        # 2. CLAHE
-        gray_clahe = apply_clahe(gray)
-        if gray_clahe.ndim == 3:
-            gray_clahe = gray_clahe.squeeze(0)
+        if not is_box_valid(roi, std_dev_thresh=STD_DEV_THRESHOLD,
+                            min_aspect=MIN_ASPECT_RATIO, max_aspect=MAX_ASPECT_RATIO):
+            continue
 
-        # 3. Resize to 100x100
+        #Preprocess (Gray -> CLAHE -> Resize)
+        gray = to_grayscale(roi)
+        gray_clahe = apply_clahe(gray)
+        if gray_clahe.ndim == 3: gray_clahe = gray_clahe.squeeze(0)
         resized = cv2.resize(gray_clahe, window_size)
 
-        # 4. To Tensor
-        tensor_input = torch.tensor(resized, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        #Prepare Tensor
+        t_roi = torch.tensor(resized, dtype=torch.float32).unsqueeze(0)
+        batch_tensors.append(t_roi)
+        batch_coords.append((x, y, w, h))
 
-        # --- PREDICT ---
-        with torch.no_grad():
-            outputs = model(tensor_input)
-            probabilities = torch.softmax(outputs, dim=1)
-            score, predicted_idx = torch.max(probabilities, dim=1)
+    if not batch_tensors: return [], {}
 
-        score = score.item()
-        label_idx = predicted_idx.item()
+    #Batch Predict (Run Model ONCE)
+    batch_input = torch.stack(batch_tensors)
 
-        # Filter by confidence
-        if score > conf_threshold:
-            # Save in format [x1, y1, x2, y2, score, label]
-            detected_boxes.append([x, y, x + w, y + h, score, label_idx])
+    with torch.no_grad():
+        outputs = model(batch_input)
+        probabilities = torch.softmax(outputs, dim=1)
+        max_scores, predicted_indices = torch.max(probabilities, dim=1)
 
-    return detected_boxes
+    #Collect Valid Detections
+    raw_boxes = []
+    for i in range(len(batch_tensors)):
+        score = max_scores[i].item()
+        if score > CONFIDENCE_THRESHOLD:
+            idx = predicted_indices[i].item()
+            x, y, w, h = batch_coords[i]
+            raw_boxes.append([x, y, x + w, y + h, score, idx])
+
+    #Apply NMS (Remove duplicates)
+    if len(raw_boxes) > 0:
+        nms_boxes = group_overlapping_boxes(raw_boxes, overlap_thresh=NMS_THRESHOLD)
+        final_boxes = remove_contained_boxes(nms_boxes)
+    else:
+        final_boxes = []
+
+    #Count Objects
+    counts = {}
+    for box in final_boxes:
+        label_idx = int(box[5])
+        name = class_names[label_idx]
+        counts[name] = counts.get(name, 0) + 1
+
+    return final_boxes, counts
 
 
-# --- STREAMLIT UI ---
+# STREAMLIT UI
+st.title("Object Detection & Counting")
 
-st.title("Object Detection: Selective Search")
-st.write("Using OpenCV Selective Search to find regions + MyCNN to classify them.")
-
-# Configuration Sidebar
-st.sidebar.header("Detection Settings")
-conf_thresh = st.sidebar.slider("Confidence Threshold", 0.4, 1.0, 0.85)
-nms_thresh = st.sidebar.slider("Overlap Threshold (NMS)", 0.0, 1.0, 0.3)
-
-uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
-
-# Load Class Names
-try:
-    class_csv = "training_data/labels.csv"
-    filenames_classnames = np.genfromtxt(class_csv, delimiter=';', skip_header=1, dtype=str)
-    class_names = np.unique(filenames_classnames[:, 1])
-    class_names.sort()
-except Exception:
-    class_names = [f"Class_{i}" for i in range(20)]
+# Load Labels
+class_names = load_class_names()
+st.sidebar.success(f"Loaded {len(class_names)} classes: {', '.join(class_names[:5])}...")
 
 
 # Load Model
@@ -107,59 +130,50 @@ def load_model():
 
 
 model = load_model()
+uploaded_file = st.file_uploader("Upload an Image", type=["jpg", "jpeg", "png"])
 
-if uploaded_file is not None and model is not None:
+if uploaded_file and model:
     image = Image.open(uploaded_file).convert("RGB")
     img_np = np.array(image)
 
-    st.image(image, caption="Original Image", width=300)
+    st.image(image, caption="Uploaded Image", use_container_width=True)
 
-    if st.button("Detect Objects"):
-        with st.spinner("Running Selective Search & Classification..."):
+    if st.button("Count & Detect"):
+        with st.spinner("Analyzing..."):
+            final_boxes, counts = predict_and_count(model, img_np, class_names)
 
-            # Run Detection using the NEW function
-            raw_boxes = predict_selective_search(model, img_np, class_names, conf_thresh)
 
-            if len(raw_boxes) > 0:
-                # 1. NMS
-                nms_boxes = group_overlapping_boxes(np.array(raw_boxes), overlap_thresh=nms_thresh)
-                # 2. Containment Filter (from previous step)
-                clean_boxes = remove_contained_boxes(nms_boxes)
-
-                # 3. NEW: Tighten the boxes
-                final_boxes = []
-                for box in clean_boxes:
-                    tight_box = tighten_box(img_np, box)
-                    final_boxes.append(tight_box)
+            if counts:
+                st.success(f"Found {len(final_boxes)} objects!")
+                cols = st.columns(3)
+                for i, (name, count) in enumerate(counts.items()):
+                    cols[i % 3].metric(label=name.capitalize(), value=count)
             else:
-                final_boxes = []
+                st.warning("No objects found (Try lowering the confidence threshold).")
 
-            # Draw Boxes
+            #Draw Boxes
             draw_img = image.copy()
             draw = ImageDraw.Draw(draw_img)
-
             try:
                 font = ImageFont.truetype("arial.ttf", 20)
             except:
                 font = ImageFont.load_default()
 
-            st.write(f"Found {len(final_boxes)} objects.")
-
             for box in final_boxes:
                 x1, y1, x2, y2, score, label_idx = box
                 label_name = class_names[int(label_idx)]
 
-                draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
-                text = f"{label_name}: {score:.2f}"
+                # Draw Red Box
+                draw.rectangle([x1, y1, x2, y2], outline="red", width=4)
 
-                # Text Background
+                # Draw Label with Background
+                text = f"{label_name}: {score:.2f}"
                 if hasattr(draw, "textbbox"):
-                    text_bbox = draw.textbbox((x1, y1), text, font=font)
-                    draw.rectangle(text_bbox, fill="red")
+                    bbox = draw.textbbox((x1, y1), text, font=font)
+                    draw.rectangle(bbox, fill="red")
                 else:
                     w_text, h_text = draw.textsize(text, font=font)
                     draw.rectangle([x1, y1, x1 + w_text, y1 + h_text], fill="red")
-
                 draw.text((x1, y1), text, fill="white", font=font)
 
-            st.image(draw_img, caption="Detected Objects", use_column_width=True)
+            st.image(draw_img, caption="Detected Objects", use_container_width=True)
