@@ -30,9 +30,6 @@ def is_box_valid(roi, std_dev_thresh=5, min_aspect=0.3, max_aspect=3.0):
     return True
 
 def group_overlapping_boxes(boxes, overlap_thresh=0.15):
-    """
-    Class-Aware NMS: Allows Cat and Dog to overlap, but removes duplicate Dogs.
-    """
     if len(boxes) == 0: return []
     boxes = np.array(boxes)
     final_boxes = []
